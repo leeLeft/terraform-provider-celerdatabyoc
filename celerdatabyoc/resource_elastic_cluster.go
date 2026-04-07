@@ -25,10 +25,10 @@ import (
 func resourceElasticCluster() *schema.Resource {
 	return &schema.Resource{
 		DeprecationMessage: "This resource is deprecated. For create new clusters, please use `celerdatabyoc_elastic_cluster_v2`",
-		CreateContext: resourceElasticClusterCreate,
-		ReadContext:   resourceElasticClusterRead,
-		DeleteContext: resourceElasticClusterDelete,
-		UpdateContext: resourceElasticClusterUpdate,
+		CreateContext:      resourceElasticClusterCreate,
+		ReadContext:        resourceElasticClusterRead,
+		DeleteContext:      resourceElasticClusterDelete,
+		UpdateContext:      resourceElasticClusterUpdate,
 		Schema: map[string]*schema.Schema{
 			"id": {
 				Type:     schema.TypeString,
@@ -699,6 +699,7 @@ func resourceElasticClusterCreate(ctx context.Context, d *schema.ResourceData, m
 
 	clusterConf.ClusterItems = append(clusterConf.ClusterItems, coordinatorItem, computeItem)
 
+	log.Printf("[DEBUG] deploy cluster: %+v", clusterConf)
 	resp, err := clusterAPI.Deploy(ctx, &cluster.DeployReq{
 		RequestId:   uuid.NewString(),
 		ClusterConf: clusterConf,
@@ -706,6 +707,7 @@ func resourceElasticClusterCreate(ctx context.Context, d *schema.ResourceData, m
 	if err != nil {
 		return diag.FromErr(err)
 	}
+	log.Printf("[DEBUG] deploy cluster: %+v", resp)
 
 	stateResp, err := WaitClusterStateChangeComplete(ctx, &waitStateReq{
 		clusterAPI: clusterAPI,
