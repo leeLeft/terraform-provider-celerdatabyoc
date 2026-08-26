@@ -1321,3 +1321,48 @@ type ChangeClusterPublicAccessConfigReq struct {
 	ClusterId string `json:"cluster_id" mapstructure:"cluster_id"`
 	Enable    bool   `json:"enable" mapstructure:"enable"`
 }
+
+// Cluster maintenance windows (security patching).
+
+const (
+	MaintenanceWindowTypeWeekly  = "WEEKLY"
+	MaintenanceWindowTypeMonthly = "MONTHLY"
+)
+
+var MaintenanceWindowTypes = []string{MaintenanceWindowTypeWeekly, MaintenanceWindowTypeMonthly}
+
+type MaintenanceWindow struct {
+	WindowId   string `json:"window_id" mapstructure:"window_id"`
+	ClusterId  string `json:"cluster_id" mapstructure:"cluster_id"`
+	WindowType string `json:"window_type" mapstructure:"window_type"`
+	DayOfWeek  string `json:"day_of_week" mapstructure:"day_of_week"` // MONDAY..SUNDAY, "" for MONTHLY
+	DayOfMonth int32  `json:"day_of_month" mapstructure:"day_of_month"`
+	StartTime  string `json:"start_time" mapstructure:"start_time"` // HH:mm
+	EndTime    string `json:"end_time" mapstructure:"end_time"`     // HH:mm
+	Timezone   string `json:"timezone" mapstructure:"timezone"`
+	Enabled    bool   `json:"enabled" mapstructure:"enabled"`
+}
+
+// UpsertMaintenanceWindowReq is the body for both create and update; the
+// backend replaces every field on update, so all of them are always sent.
+type UpsertMaintenanceWindowReq struct {
+	WindowType string `json:"window_type"`
+	DayOfWeek  string `json:"day_of_week,omitempty"`
+	DayOfMonth int32  `json:"day_of_month"`
+	StartTime  string `json:"start_time"`
+	EndTime    string `json:"end_time"`
+	Timezone   string `json:"timezone"`
+	Enabled    bool   `json:"enabled"`
+}
+
+type CreateMaintenanceWindowResp struct {
+	WindowId string `json:"window_id" mapstructure:"window_id"`
+}
+
+type GetMaintenanceWindowResp struct {
+	Window *MaintenanceWindow `json:"window" mapstructure:"window"`
+}
+
+type ListMaintenanceWindowsResp struct {
+	Windows []*MaintenanceWindow `json:"windows" mapstructure:"windows"`
+}
