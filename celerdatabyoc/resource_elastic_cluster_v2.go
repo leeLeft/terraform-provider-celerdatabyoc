@@ -187,10 +187,12 @@ func resourceElasticClusterV2() *schema.Resource {
 								CROSSING_AZ,
 								MULTI_AZ,
 							}, false),
+							DiffSuppressFunc: suppressPinnedPolicyDiff,
 						},
 						"specify_az": {
-							Type:     schema.TypeString,
-							Optional: true,
+							Type:             schema.TypeString,
+							Optional:         true,
+							DiffSuppressFunc: suppressPinnedSpecifyAzDiff,
 						},
 						"specified_azs": {
 							Type:             schema.TypeList,
@@ -323,10 +325,12 @@ func resourceElasticClusterV2() *schema.Resource {
 								CROSSING_AZ,
 								MULTI_AZ,
 							}, false),
+							DiffSuppressFunc: suppressPinnedPolicyDiff,
 						},
 						"specify_az": {
-							Type:     schema.TypeString,
-							Optional: true,
+							Type:             schema.TypeString,
+							Optional:         true,
+							DiffSuppressFunc: suppressPinnedSpecifyAzDiff,
 						},
 						"specified_azs": {
 							Type:             schema.TypeList,
@@ -726,6 +730,51 @@ func resourceElasticClusterV2() *schema.Resource {
 	}
 }
 
+// validateMultiAzConversionTarget mirrors the backend's validateConvertTargetNetwork
+// (sr-cloud-platform central/service/web/service/cluster_convert_multi_az.go) plus the
+// single-AZ -> multi-AZ direction gate. old is the cluster's current network; target is
+// the network the caller is changing network_id to. It is a pure function (no API calls)
+// so both customizeEl2Diff (plan-time, once the target network is known) and
+// resourceElasticClusterV2Update (apply-time, immediately before invoking the conversion
+// SDK call) can share one source of truth instead of re-deriving these invariants.
+func validateMultiAzConversionTarget(old, target *network.Network) error {
+	if old.MultiAz && old.BizID != target.BizID {
+		return errors.New("changing `network_id` is only supported to convert a single-AZ cluster to multi-AZ (single-AZ network -> multi-AZ network); the cluster's current network is already multi-AZ")
+	}
+	if !target.MultiAz {
+		return errors.New("changing `network_id` is only supported to convert a single-AZ cluster to multi-AZ; the target network is not a multi-AZ network")
+	}
+	if target.RegionId != old.RegionId || target.CspId != old.CspId {
+		return errors.New("the target network must be in the same region and cloud as the cluster's current network")
+	}
+
+	rows := target.AZNetWorkInterfaces
+	azSet := make(map[string]struct{}, len(rows))
+	subnetSet := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		azSet[row.Az] = struct{}{}
+		subnetSet[row.SubnetId] = struct{}{}
+	}
+	if len(rows) != 3 || len(azSet) != 3 {
+		return errors.New("the target network must span exactly 3 distinct availability zones")
+	}
+	// Containment among the AZ rows is the invariant, and it is the ONLY one: the existing FE/BE
+	// nodes and the load balancer live in the cluster's current primary subnet and must stay valid
+	// after the rebind. The target's own top-level subnet_id is deliberately NOT compared — a
+	// natively-multi-AZ network config is allowed an empty top-level subnet, and the conversion
+	// derives its primary AZ from the FE leader's AZ rather than from any top-level subnet field.
+	// Both backend layers agree (web validateConvertTargetNetwork, data RebindToMultiAzNetworkTx);
+	// requiring equality here would reject targets the backend accepts, so a config that applies
+	// fine through the console would fail at plan time.
+	if _, ok := subnetSet[old.SubnetId]; !ok {
+		return errors.New("the target network must include the cluster's current primary subnet among its 3 AZ subnets")
+	}
+	if target.SecurityGroupId != old.SecurityGroupId {
+		return errors.New("the target network's security_group_id must match the cluster's current network's security_group_id")
+	}
+	return nil
+}
+
 func customizeEl2Diff(ctx context.Context, d *schema.ResourceDiff, m interface{}) error {
 	c := m.(*client.CelerdataClient)
 	clusterAPI := cluster.NewClustersAPI(c)
@@ -754,8 +803,20 @@ func customizeEl2Diff(ctx context.Context, d *schema.ResourceDiff, m interface{}
 	warehouses = append(warehouses, d.Get("default_warehouse").([]interface{})[0])
 	warehouses = append(warehouses, d.Get("warehouse").([]interface{})...)
 
-	if len(d.Get("network_id").(string)) > 0 {
-		netResp, err := networkAPI.GetNetwork(ctx, d.Get("network_id").(string))
+	coordinatorNodeCount := d.Get("coordinator_node_count").(int)
+	if d.HasChange("coordinator_node_count") {
+		_, n := d.GetChange("coordinator_node_count")
+		coordinatorNodeCount = n.(int)
+	}
+
+	// netIDChanged is true only for a single-AZ -> multi-AZ conversion attempt on an
+	// existing cluster (Create always has HasChange("network_id") == false: there is no
+	// "old" value to change from).
+	netIDChanged := d.HasChange("network_id") && !isNewResource
+	newNetID := d.Get("network_id").(string)
+	newNetIDKnown := d.NewValueKnown("network_id")
+	if len(newNetID) > 0 && newNetIDKnown {
+		netResp, err := networkAPI.GetNetwork(ctx, newNetID)
 		if err != nil {
 			return err
 		}
@@ -765,22 +826,38 @@ func customizeEl2Diff(ctx context.Context, d *schema.ResourceDiff, m interface{}
 			return errors.New("The current cluster does not support disabling public access, the VPC endpoint config could not be found.")
 		}
 
-		coordinatorNodeCount := d.Get("coordinator_node_count").(int)
-		if d.HasChange("coordinator_node_count") {
-			_, n := d.GetChange("coordinator_node_count")
-			coordinatorNodeCount = n.(int)
+		// Direction first. A revert (multi-AZ -> single-AZ) is illegal whatever the
+		// warehouses look like, and the single-AZ branch below would otherwise reject it
+		// with "distribution_policy must be empty" -- a message about the wrong thing,
+		// since the conversion pins a policy the config never asked for (see
+		// suppressPinnedPolicyDiff) and the user cannot clear it while the cluster is on a
+		// multi-AZ network.
+		if netIDChanged {
+			o, _ := d.GetChange("network_id")
+			oldNetResp, err := networkAPI.GetNetwork(ctx, o.(string))
+			if err != nil {
+				return fmt.Errorf("get cluster's current network (%s): %s", o.(string), err.Error())
+			}
+			if err := validateMultiAzConversionTarget(oldNetResp.Network, netResp.Network); err != nil {
+				return err
+			}
 		}
 
 		if netResp.Network.MultiAz {
 			if coordinatorNodeCount < 3 {
+				if netIDChanged {
+					return errors.New("multi-AZ conversion requires at least 3 coordinators; scale coordinator_node_count to 3 first")
+				}
 				return errors.New("in multi-AZ deployment mode, the number of coordinator nodes should be greater than or equal to 3")
 			}
-			for _, v := range warehouses {
-				vMap := v.(map[string]interface{})
-				if len(vMap["distribution_policy"].(string)) == 0 {
-					return errors.New("in multi-AZ deployment mode, the distribution_policy parameter of warehouse can not be empty")
-				}
-			}
+			// A multi-AZ network with an empty (or "specify_az") warehouse
+			// distribution_policy is a legal state: a single->multi conversion leaves
+			// warehouse policy untouched, and policy is managed independently at the
+			// warehouse level (celerdatabyoc_elastic_cluster_v2.warehouse /
+			// default_warehouse, or the change-distribution flow). Only the reverse
+			// direction (single-AZ network forbids a non-empty policy) is enforced below.
+			// Keeping that pinned state out of the plan's way is suppressPinnedPolicyDiff /
+			// suppressPinnedSpecifyAzDiff, on the two attributes themselves.
 
 			// specified_azs must reference AZ *names* that actually exist in the
 			// cluster network (e.g. "us-west-2a"), not AZ ids ("usw2-az1") or
@@ -826,6 +903,16 @@ func customizeEl2Diff(ctx context.Context, d *schema.ResourceDiff, m interface{}
 					return errors.New("in single-AZ deployment mode, the distribution_policy parameter of warehouse must be empty")
 				}
 			}
+		}
+	} else if netIDChanged {
+		// network_id is changing to a value only known at apply time (e.g. a
+		// celerdatabyoc_aws_network created in the same plan). The target's AZ/subnet/
+		// security-group invariants can't be checked against a real network yet — that
+		// full re-validation (via validateMultiAzConversionTarget) happens in the Update
+		// pre-step once the target network_id is resolved. Only the structural,
+		// network-independent rule can be enforced now.
+		if coordinatorNodeCount < 3 {
+			return errors.New("multi-AZ conversion requires at least 3 coordinators; scale coordinator_node_count to 3 first")
 		}
 	}
 
@@ -1394,7 +1481,7 @@ func resourceElasticClusterV2Create(ctx context.Context, d *schema.ResourceData,
 	}
 
 	if stateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
-		return diag.FromErr(errors.New(stateResp.AbnormalReason))
+		return diag.FromErr(abnormalErr(clusterId, "deploying the cluster", stateResp.AbnormalReason))
 	}
 	log.Printf("[DEBUG] deploy succeeded, action id:%s cluster id:%s]", resp.ActionID, resp.ClusterID)
 
@@ -2071,12 +2158,16 @@ func elasticClusterV2NeedUnlock(d *schema.ResourceData) bool {
 }
 
 func resourceElasticClusterV2Update(ctx context.Context, d *schema.ResourceData, m interface{}) diag.Diagnostics {
-	var immutableFields = []string{"csp", "region", "cluster_name", "data_credential_id", "deployment_credential_id", "network_id", "query_port"}
+	var immutableFields = []string{"csp", "region", "cluster_name", "data_credential_id", "deployment_credential_id", "query_port"}
 	for _, f := range immutableFields {
 		if d.HasChange(f) && !d.IsNewResource() {
 			return diag.FromErr(fmt.Errorf("the `%s` field is not allowed to be modified", f))
 		}
 	}
+	// network_id is no longer in immutableFields: it may change to convert a
+	// single-AZ cluster to multi-AZ. The directed guard (single-AZ -> multi-AZ only;
+	// every other direction stays a hard error) is enforced below, together with the
+	// conversion itself, right before netResp is fetched for the warehouse handlers.
 
 	c := m.(*client.CelerdataClient)
 
@@ -2115,7 +2206,7 @@ func resourceElasticClusterV2Update(ctx context.Context, d *schema.ResourceData,
 	}
 
 	if stateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
-		return diag.FromErr(errors.New(stateResp.AbnormalReason))
+		return diag.FromErr(abnormalErr(clusterId, "changing the cluster state", stateResp.AbnormalReason))
 	}
 
 	// Top-level flags (config-ish, must run before REDUCE so reductions see the right state)
@@ -2325,6 +2416,75 @@ func resourceElasticClusterV2Update(ctx context.Context, d *schema.ResourceData,
 	feScaleUpChanged := d.HasChange("coordinator_node_size") && !d.IsNewResource()
 	customAmiChanged := d.HasChange("custom_ami.0.ami") && !d.IsNewResource()
 
+	// Single-AZ -> multi-AZ conversion pre-step. This is the directed guard for
+	// network_id changes (immutableFields no longer includes it): re-validate every
+	// invariant against live data (plan-time validation in customizeEl2Diff can go
+	// stale between plan and apply, and can't validate at all when the target
+	// network_id was unknown at plan time), then drive the backend conversion and wait
+	// for it to land before any of the warehouse-handling code below runs against the
+	// (post-conversion) target network.
+	if d.HasChange("network_id") && !d.IsNewResource() {
+		oldNetID, newNetID := d.GetChange("network_id")
+
+		oldNetResp, err := networkAPI.GetNetwork(ctx, oldNetID.(string))
+		if err != nil {
+			return diag.FromErr(fmt.Errorf("get cluster's current network (%s): %s", oldNetID.(string), err.Error()))
+		}
+		newNetResp, err := networkAPI.GetNetwork(ctx, newNetID.(string))
+		if err != nil {
+			return diag.FromErr(fmt.Errorf("get target network (%s): %s", newNetID.(string), err.Error()))
+		}
+		if err := validateMultiAzConversionTarget(oldNetResp.Network, newNetResp.Network); err != nil {
+			return diag.FromErr(err)
+		}
+		if d.Get("coordinator_node_count").(int) < 3 {
+			return diag.FromErr(errors.New("multi-AZ conversion requires at least 3 coordinators; scale coordinator_node_count to 3 first"))
+		}
+
+		convResp, err := clusterAPI.ConvertClusterToMultiAz(ctx, &cluster.ConvertClusterToMultiAzReq{
+			ClusterID: clusterId,
+			NetworkID: newNetID.(string),
+		})
+		if err != nil {
+			return diag.FromErr(fmt.Errorf("cluster (%s) failed to convert to multi-AZ: %s", clusterId, err.Error()))
+		}
+
+		convStateResp, err := WaitClusterStateChangeComplete(ctx, &waitStateReq{
+			clusterAPI: clusterAPI,
+			clusterID:  clusterId,
+			actionID:   convResp.OrderID,
+			timeout:    common.DeployOrScaleClusterTimeout,
+			pendingStates: []string{
+				string(cluster.ClusterStateDeploying),
+				string(cluster.ClusterStateScaling),
+				string(cluster.ClusterStateResuming),
+				string(cluster.ClusterStateSuspending),
+				string(cluster.ClusterStateReleasing),
+				string(cluster.ClusterStateUpdating),
+			},
+			targetStates: []string{
+				string(cluster.ClusterStateRunning),
+				string(cluster.ClusterStateSuspended),
+				string(cluster.ClusterStateAbnormal),
+				string(cluster.ClusterStateReleased),
+			},
+		})
+		if err != nil {
+			return diag.FromErr(fmt.Errorf("waiting for cluster (%s) multi-AZ conversion to complete: %s", clusterId, err))
+		}
+		if convStateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
+			return diag.FromErr(fmt.Errorf("cluster (%s) became abnormal during multi-AZ conversion: %s", clusterId, convStateResp.AbnormalReason))
+		}
+		if convStateResp.ClusterState == string(cluster.ClusterStateReleased) {
+			d.SetId("")
+			return diag.FromErr(fmt.Errorf("cluster (%s) not found after multi-AZ conversion", clusterId))
+		}
+		// On any earlier failure in this block, the backend's conversion executor never
+		// ran (or its rebind is all-or-nothing/idempotent per the conversion contract),
+		// so network_id in state stays at its pre-conversion value; the next Read
+		// resyncs it from the backend either way (self-healing on retry).
+	}
+
 	netResp, err := networkAPI.GetNetwork(ctx, d.Get("network_id").(string))
 	if err != nil {
 		return diag.FromErr(fmt.Errorf("get network (%s): %s", d.Get("network_id").(string), err.Error()))
@@ -2529,7 +2689,7 @@ func createWarehouse(ctx context.Context, clusterAPI cluster.IClusterAPI, cluste
 		}
 
 		if stateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
-			return diag.FromErr(errors.New(stateResp.AbnormalReason))
+			return diag.FromErr(abnormalErr(clusterId, "creating warehouse", stateResp.AbnormalReason))
 		}
 	}
 
@@ -2791,7 +2951,7 @@ func updateWarehouse(ctx context.Context, req *UpdateWarehouseReq, multiAz bool)
 			}
 
 			if stateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
-				return diag.FromErr(errors.New(stateResp.AbnormalReason))
+				return diag.FromErr(abnormalErr(clusterId, "updating warehouse", stateResp.AbnormalReason))
 			}
 		}
 	} else if req.customAmiChanged {
@@ -3081,7 +3241,7 @@ func deleteWarehouse(ctx context.Context, clusterAPI cluster.IClusterAPI, cluste
 		}
 
 		if stateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
-			return diag.FromErr(errors.New(stateResp.AbnormalReason))
+			return diag.FromErr(abnormalErr(clusterId, "deleting warehouse", stateResp.AbnormalReason))
 		}
 	}
 	return diags
@@ -3187,7 +3347,7 @@ func resumeWarehouse(ctx context.Context, clusterAPI cluster.IClusterAPI, cluste
 		}
 
 		if stateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
-			return diag.FromErr(errors.New(stateResp.AbnormalReason))
+			return diag.FromErr(abnormalErr(clusterId, "resuming warehouse", stateResp.AbnormalReason))
 		}
 	}
 	return diags
@@ -3302,7 +3462,7 @@ func handleFEScaleUp(ctx context.Context, d *schema.ResourceData, clusterAPI clu
 	}
 
 	if stateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
-		return diag.FromErr(errors.New(stateResp.AbnormalReason))
+		return diag.FromErr(abnormalErr(clusterId, "scaling up coordinator nodes", stateResp.AbnormalReason))
 	}
 
 	return nil
@@ -3337,7 +3497,7 @@ func handleFEScaleUpAndUpgradeAMI(ctx context.Context, d *schema.ResourceData, c
 	}
 
 	if stateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
-		return diag.FromErr(errors.New(stateResp.AbnormalReason))
+		return diag.FromErr(abnormalErr(clusterId, "scaling up coordinator nodes and upgrading the AMI", stateResp.AbnormalReason))
 	}
 
 	return nil
@@ -3372,7 +3532,7 @@ func handleFEScaleIn(ctx context.Context, d *schema.ResourceData, clusterAPI clu
 	}
 
 	if stateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
-		return diag.FromErr(errors.New(stateResp.AbnormalReason))
+		return diag.FromErr(abnormalErr(clusterId, "scaling in coordinator nodes", stateResp.AbnormalReason))
 	}
 
 	return nil
@@ -3407,7 +3567,7 @@ func handleFEScaleOut(ctx context.Context, d *schema.ResourceData, clusterAPI cl
 	}
 
 	if stateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
-		return diag.FromErr(errors.New(stateResp.AbnormalReason))
+		return diag.FromErr(abnormalErr(clusterId, "scaling out coordinator nodes", stateResp.AbnormalReason))
 	}
 
 	return nil
@@ -3703,7 +3863,7 @@ func scaleWarehouseNum(ctx context.Context, clusterAPI cluster.IClusterAPI, clus
 	}
 
 	if stateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
-		return errors.New(stateResp.AbnormalReason)
+		return abnormalErr(clusterId, "scaling warehouse compute nodes", stateResp.AbnormalReason)
 	}
 	return nil
 }
@@ -3949,7 +4109,7 @@ func handleWarehouseScaleUpAndUpgradeAMI(ctx context.Context, d *schema.Resource
 	}
 
 	if stateResp.ClusterState == string(cluster.ClusterStateAbnormal) {
-		return errors.New(stateResp.AbnormalReason)
+		return abnormalErr(clusterId, "scaling up warehouse nodes and upgrading the AMI", stateResp.AbnormalReason)
 	}
 
 	return nil
@@ -4198,4 +4358,77 @@ func getVolumeAutoscalingFromYaml(yamlConfig map[string]interface{}) (*cluster.V
 	}
 
 	return autoscalingConfig, nil
+}
+
+// abnormalErr builds the error for "the operation finished with the cluster in Abnormal".
+//
+// It exists because AbnormalReason is not always populated -- an action that fails while the
+// backend is still initializing it comes back empty, and the bare errors.New("") this code used
+// to return renders as terraform's "Empty Summary: This is always a bug in the provider and
+// should be reported to the provider developers". That message is about the wrong bug entirely:
+// it says nothing about the cluster, and it sends whoever reads it hunting in the provider.
+//
+// Measured on stage 2026-08-05: a coordinator 3 -> 5 scale-out on a freshly converted multi-AZ
+// cluster produced exactly that, hiding a backend workspace error; the warehouse scale-out that
+// ran next in the same suite produced it again from a different call site. Hence one helper and
+// every elastic_v2 wait site routed through it, rather than fixing them one bite at a time.
+//
+// resource_classic_cluster.go and resource_elastic_cluster.go carry the same bare pattern; they
+// are left alone because this feature does not touch those resources.
+func abnormalErr(clusterID, operation, abnormalReason string) error {
+	if len(abnormalReason) == 0 {
+		abnormalReason = "the backend reported no reason; check the cluster's action history"
+	}
+	return fmt.Errorf("cluster (%s) became abnormal while %s: %s", clusterID, operation, abnormalReason)
+}
+
+// suppressPinnedPolicyDiff makes an undeclared warehouse distribution_policy mean "whatever
+// placement the backend pinned", not "clear it".
+//
+// A single-AZ -> multi-AZ conversion pins every previously-Unset warehouse to
+// SpecifyAZ/<primary az> (the backend's SetWarehousesBEDistributionSpecifyAZTx) without moving
+// a single node, and Read backfills that into state. A config that never declared a policy
+// reads back as "", so without this the first plan after a conversion is
+// `distribution_policy "specify_az" -> null` on every warehouse, and updateWarehouse turns that
+// into a ChangeWarehouseDistribution call with an empty policy, which the backend rejects with
+// "param distribution_policy is invalid" -- every apply after a successful conversion fails
+// until the user hand-copies the pinned values into their config. Measured on stage 2026-08-05:
+// it took out 6 of the elastic_v2_az_conversion e2e cases, starting with a plain re-apply of
+// the vars that had just succeeded.
+//
+// Only SPECIFY_AZ is absorbed. MULTI_AZ and CROSSING_AZ never reach state without a config
+// asking for them, so an emptied policy there is a real user-requested change and must still
+// reach the backend.
+func suppressPinnedPolicyDiff(_, old, new string, _ *schema.ResourceData) bool {
+	return new == "" && old == SPECIFY_AZ
+}
+
+// suppressPinnedSpecifyAzDiff does the same for specify_az, but only while its sibling
+// distribution_policy is itself being suppressed. Two reasons it has to be conditional:
+// ChangeWarehouseDistribution takes the pair, and updateWarehouse's
+// computeNodeDistributionChanged compares specify_az whenever the policy is SPECIFY_AZ -- so
+// absorbing the policy alone would still diff on the AZ and re-issue the rejected call. And
+// suppressing specify_az unconditionally would break a legitimate switch to MULTI_AZ (config
+// clears specify_az; a suppressed diff would leave the old AZ in place and trip
+// customizeEl2Diff's "specify_az must be empty when distribution_policy is multi_az").
+//
+// Resolving the sibling from the flattened key mirrors suppressSpecifiedAZsDiff. What it reads
+// is the sibling's EFFECTIVE value, after suppressPinnedPolicyDiff has already run on it:
+// terraform walks a block's attributes in sorted key order, so distribution_policy is resolved
+// before specify_az, and by this point a suppressed policy reads back as the pinned SPECIFY_AZ
+// rather than as the config's "" (verified against a converted stage cluster 2026-08-05 --
+// GetChange reports new == "specify_az" here, not ""). So the condition is simply "the policy
+// this warehouse ends up with is the pin": a config declaring some other policy reads back as
+// that policy and its specify_az is left to diff normally.
+func suppressPinnedSpecifyAzDiff(k, old, new string, d *schema.ResourceData) bool {
+	if new != "" || old == "" {
+		return false
+	}
+	policyKey := strings.TrimSuffix(k, "specify_az")
+	if policyKey == k {
+		return false
+	}
+	policyKey += "distribution_policy"
+	policy, _ := d.Get(policyKey).(string)
+	return policy == SPECIFY_AZ
 }

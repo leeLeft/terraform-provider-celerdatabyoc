@@ -1250,6 +1250,20 @@ type ChangeClusterAdminPasswordReq struct {
 	Password  string `json:"password" mapstructure:"password"`
 }
 
+// ConvertClusterToMultiAzReq is the body of the single-AZ -> multi-AZ cluster
+// conversion endpoint. ClusterID travels in the URL path (matching every other
+// per-cluster endpoint in this file); it is also included in the JSON body for
+// consistency with sibling request structs (e.g. RunScriptsReq), though the
+// server reads the cluster id from the path.
+type ConvertClusterToMultiAzReq struct {
+	ClusterID string `json:"cluster_id" mapstructure:"cluster_id"`
+	NetworkID string `json:"network_id" mapstructure:"network_id"`
+}
+
+type ConvertClusterToMultiAzResp struct {
+	OrderID string `json:"order_id" mapstructure:"order_id"`
+}
+
 type OperateRangerConfigV2Resp struct {
 	InfraActionID string `json:"infra_action_id" mapstructure:"infra_action_id"`
 }

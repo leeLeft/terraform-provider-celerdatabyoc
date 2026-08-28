@@ -116,9 +116,9 @@ This resource contains the following required and optional arguments:
 
 **Optional**
 
-~> You can only specify either `subnet_id` or `subnet_ids`.
+~> You must specify at least one of `subnet_id` or `subnet_ids`.
 
-- `subnet_id`: (String, Forces new resource) The ID of the subnet in which you use to deploy cluster nodes.
+- `subnet_id`: (String, Forces new resource) The ID of the subnet in which you use to deploy cluster nodes. If you also specify `subnet_ids` (Multi-AZ), `subnet_id` must be one of the subnets listed in `subnet_ids`; it pins that subnet as the network's primary subnet. This is required if the network will be the target of a single-AZ -> multi-AZ conversion (see below), since the primary subnet must exactly match the original network's `subnet_id`. If you specify `subnet_ids` without `subnet_id`, the network has no pinned primary subnet.
 
 - `subnet_ids`: (List of strings, Forces new resources) The IDs of the subnets in which you use to deploy cluster nodes if you want to enable Multi-AZ Deployment for the cluster. Please note that Multi-AZ Deployment is only available for elastic clusters. You must reference three subnets in this argument. The three subnets must be under the same VPC in different availability zones. They must all be private subnets or public subnets. For more information, see [Multi-AZ Deployment](https://docs.celerdata.com/BYOC/docs/get_started/create_cluster/aws_cluster/multi-az/).
 
@@ -131,6 +131,57 @@ This resource contains the following required and optional arguments:
 This resource exports the following attribute:
 
 - `id`: (String) The ID of this resource.
+
+## Converting a single-AZ cluster to multi-AZ
+
+A `celerdatabyoc_aws_network` resource itself is always immutable (every argument forces
+a new resource). To convert an already-deployed single-AZ `celerdatabyoc_elastic_cluster_v2`
+cluster to Multi-AZ, create a **second** `celerdatabyoc_aws_network` resource for the
+multi-AZ target, and repoint the cluster's `network_id` at it — the conversion happens on
+the cluster resource, not on either network resource. See
+[`celerdatabyoc_elastic_cluster_v2`](../resources/elastic_cluster_v2.md#argument-reference)
+for the conversion's prerequisites, behavior, and failure semantics.
+
+```terraform
+# The cluster's original single-AZ network (already deployed; unchanged).
+resource "celerdatabyoc_aws_network" "single_az" {
+  name                     = "<network_name>"
+  subnet_id                = "<subnet_id>"
+  security_group_id        = "<security_group_id>"
+  region                   = "<AWS_region>"
+  deployment_credential_id = celerdatabyoc_aws_deployment_role_credential.deployment_role_credential.id
+}
+
+# The multi-AZ conversion target. Its top-level subnet_id must equal the original
+# network's subnet_id and must also be one of the 3 subnet_ids entries. Same
+# security_group_id and region as the original network.
+resource "celerdatabyoc_aws_network" "multi_az" {
+  name = "<network_name>_multi_az"
+  subnet_ids = [
+    celerdatabyoc_aws_network.single_az.subnet_id, # must be included, and reused as subnet_id below
+    "<subnet_id_in_second_az>",
+    "<subnet_id_in_third_az>",
+  ]
+  subnet_id                = celerdatabyoc_aws_network.single_az.subnet_id
+  security_group_id        = celerdatabyoc_aws_network.single_az.security_group_id
+  region                   = celerdatabyoc_aws_network.single_az.region
+  deployment_credential_id = celerdatabyoc_aws_deployment_role_credential.deployment_role_credential.id
+}
+
+resource "celerdatabyoc_elastic_cluster_v2" "cluster" {
+  # ... other required arguments omitted ...
+
+  network_id             = celerdatabyoc_aws_network.multi_az.id # was: celerdatabyoc_aws_network.single_az.id
+  coordinator_node_count = 3                                     # must be >= 3 before converting
+}
+```
+
+~> Setting `subnet_id` together with `subnet_ids` (as above) is required for this use
+case: it pins which one of the 3 `subnet_ids` becomes the network's primary subnet
+(`subnet_ids` is an unordered set, so there is no other way to control this). If you
+create a multi-AZ network with `subnet_ids` alone, its primary subnet is left unset, and
+the cluster resource will reject it as a conversion target since an unset primary subnet
+can never equal the original network's `subnet_id`.
 
 ## See Also
 

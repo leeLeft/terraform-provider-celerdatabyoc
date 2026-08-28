@@ -112,6 +112,8 @@ type IClusterAPI interface {
 	UninstallAuditLoaderPlugin(ctx context.Context, req *UninstallAuditLoaderPluginReq) (*UninstallAuditLoaderPluginResp, error)
 	ChangeClusterAdminPassword(ctx context.Context, req *ChangeClusterAdminPasswordReq) error
 	ChangeClusterPublicAccessConfig(ctx context.Context, req *ChangeClusterPublicAccessConfigReq) error
+
+	ConvertClusterToMultiAz(ctx context.Context, req *ConvertClusterToMultiAzReq) (*ConvertClusterToMultiAzResp, error)
 }
 
 func NewClustersAPI(cli *client.CelerdataClient) IClusterAPI {
@@ -838,4 +840,13 @@ func (c *clusterAPI) UninstallAuditLoaderPlugin(ctx context.Context, req *Uninst
 
 func (c *clusterAPI) ChangeClusterAdminPassword(ctx context.Context, req *ChangeClusterAdminPasswordReq) error {
 	return c.cli.Put(ctx, fmt.Sprintf("/api/%s/clusters/%s/admin-user-password", c.apiVersion, req.ClusterId), req, nil)
+}
+
+func (c *clusterAPI) ConvertClusterToMultiAz(ctx context.Context, req *ConvertClusterToMultiAzReq) (*ConvertClusterToMultiAzResp, error) {
+	resp := &ConvertClusterToMultiAzResp{}
+	err := c.cli.Post(ctx, fmt.Sprintf("/api/%s/clusters/%s/convert-multi-az", c.apiVersion, req.ClusterID), req, resp)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
 }

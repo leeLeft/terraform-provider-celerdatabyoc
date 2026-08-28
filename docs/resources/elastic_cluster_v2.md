@@ -179,9 +179,21 @@ The `celerdatabyoc_elastic_cluster_v2` resource contains the following required 
   - If you deploy the cluster on AWS, set this argument to `celerdatabyoc_aws_data_credential.<resource_name>.id` and replace `<resource_name>` with the name of the `celerdatabyoc_aws_data_credential` resource.
   - If you deploy the cluster on Azure, set this argument to `celerdatabyoc_azure_data_credential.<resource_name>.id` and replace `<resource_name>` with the name of the `celerdatabyoc_azure_data_credential` resource.
 
-- `network_id`: (Not allowed to modify) The ID of the network configuration.
+- `network_id`: The ID of the network configuration.
   - If you deploy the cluster on AWS, set this argument to `celerdatabyoc_aws_network.<resource_name>.id` and replace `<resource_name>` with the name of the `celerdatabyoc_aws_network` resource.
   - If you deploy the cluster on Azure, set this argument to `celerdatabyoc_azure_network.<resource_name>.id` and replace `<resource_name>` with the name of the `celerdatabyoc_azure_network` resource.
+
+  ~> In general this argument is not allowed to be modified. The one supported exception (AWS only, `celerdatabyoc_elastic_cluster_v2` only — not `celerdatabyoc_elastic_cluster` and not `celerdatabyoc_classic_cluster`) is converting an already-deployed single-AZ cluster to Multi-AZ, by pointing `network_id` at a different `celerdatabyoc_aws_network` resource. Every other kind of `network_id` change (multi-AZ to single-AZ, multi-AZ to a different multi-AZ network, or repointing between two single-AZ networks) is still rejected.
+
+    To convert a single-AZ cluster, create a new `celerdatabyoc_aws_network` resource that:
+    - Uses `subnet_ids` (not `subnet_id`) with exactly 3 subnets, spanning 3 distinct availability zones.
+    - Includes the original network's `subnet_id` among those 3 subnets, **and** sets its own top-level `subnet_id` to that exact same value (the two must be equal, not merely overlapping — see [`celerdatabyoc_aws_network`](../resources/aws_network.md)).
+    - Uses the same `security_group_id` as the original network.
+    - Is in the same `region` (and therefore the same cloud/account) as the cluster.
+
+    Then change `network_id` to that new resource's ID. Before applying, scale `coordinator_node_count` to at least `3` — the conversion needs one coordinator per AZ and is rejected otherwise. The conversion is a zero-cost, cluster-level operation: it rebinds the cluster's network and redistributes FE/coordinator nodes across the 3 AZs. It does **not** touch any warehouse's `distribution_policy` — a converted cluster is left with `multi_az = true` at the network level while warehouses keep whatever policy they already had (including empty/`specify_az`, which is a valid combination after conversion). Adopt `multi_az` distribution policy for a warehouse separately, as a follow-up change, if you want it.
+
+    If the conversion fails partway through apply (e.g. the wait for the cluster to return to `Running` times out), `network_id` in Terraform state is left unresolved until the next `Read`, which re-syncs it from the backend's actual value — so state self-heals on the next `plan`/`apply`, and a retried `apply` is safe to run again.
 
 - `default_warehouse`: (List of Object) The default warehouse. The attributes of a default warehouse include:
     - `compute_node_size`: (Required) The instance type for compute nodes in the cluster. Select a compute node instance type from the table "[Supported Node Sizes](#supported-node-sizes)". For example, you can set this argument to `r6id.4xlarge`.
@@ -211,6 +223,8 @@ The `celerdatabyoc_elastic_cluster_v2` resource contains the following required 
       For more information, see [Multi-AZ Deployment](https://docs.celerdata.com/BYOC/docs/get_started/create_cluster/aws_cluster/multi-az/).
 
       ~> To enable Multi-AZ Deployment, you must deploy at least 3 coordinator nodes, that is, `coordinator_node_count` must be greater or equal to `3`.
+
+      Switching a `multi_az` warehouse back to `specify_az` takes one of two paths. Naming an AZ from the current `specified_azs` **and** setting `compute_node_count` to that AZ's existing share (`current_count / len(current_specified_azs)`) keeps those nodes and scales the other AZs in. Any other combination — an AZ outside `specified_azs`, or a different node count, such as resizing in the same change — replaces every compute node. To collapse and resize while keeping nodes, apply the two as separate changes, collapse first.
 
     - `specify_az`: (Optional, supported on AWS and GCP) The primary availability zone for node deployment. This argument is available only when `distribution_policy` is set to `specify_az`. AZ naming follows the cloud convention: `us-west-2a` on AWS, `us-central1-a` on GCP.
 
@@ -273,6 +287,8 @@ The `celerdatabyoc_elastic_cluster_v2` resource contains the following required 
       For more information, see [Multi-AZ Deployment](https://docs.celerdata.com/BYOC/docs/get_started/create_cluster/aws_cluster/multi-az/).
 
       ~> To enable Multi-AZ Deployment, you must deploy at least 3 Coordinator Nodes, that is, `coordinator_node_count` must be greater or equal to `3`.
+
+      Switching a `multi_az` warehouse back to `specify_az` takes one of two paths. Naming an AZ from the current `specified_azs` **and** setting `compute_node_count` to that AZ's existing share (`current_count / len(current_specified_azs)`) keeps those nodes and scales the other AZs in. Any other combination — an AZ outside `specified_azs`, or a different node count, such as resizing in the same change — replaces every compute node. To collapse and resize while keeping nodes, apply the two as separate changes, collapse first.
 
     - `specify_az`:  (Supported on AWS and GCP) The primary availability zone for node deployment. This argument is available only when `distribution_policy` is set to `specify_az`. AZ naming follows the cloud convention: `us-west-2a` on AWS, `us-central1-a` on GCP.
 
