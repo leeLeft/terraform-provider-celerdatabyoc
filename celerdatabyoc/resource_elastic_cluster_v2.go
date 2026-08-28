@@ -1485,6 +1485,15 @@ func resourceElasticClusterV2Create(ctx context.Context, d *schema.ResourceData,
 	}
 	log.Printf("[DEBUG] deploy succeeded, action id:%s cluster id:%s]", resp.ActionID, resp.ClusterID)
 
+	// The wait above is keyed by action id and reflects the deploy *order* state,
+	// which reads Running as soon as the order is created. Follow-up operations
+	// (e.g. CreateWarehouse) are validated by the backend against the cluster's
+	// real state, which can still lag as Deploying/Abnormal for a short window.
+	// Re-wait by cluster id so that state is Running before continuing.
+	if _, err := waitClusterRunningByClusterID(ctx, clusterAPI, clusterId, common.DeployOrScaleClusterTimeout); err != nil {
+		return diag.FromErr(err)
+	}
+
 	if v, ok := d.GetOk("coordinator_node_volume_autoscaling"); ok {
 		yamlConfig := v.([]interface{})[0].(map[string]interface{})
 		autoscalingConfig, err := getVolumeAutoscalingFromYaml(yamlConfig)

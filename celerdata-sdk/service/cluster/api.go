@@ -114,6 +114,13 @@ type IClusterAPI interface {
 	ChangeClusterPublicAccessConfig(ctx context.Context, req *ChangeClusterPublicAccessConfigReq) error
 
 	ConvertClusterToMultiAz(ctx context.Context, req *ConvertClusterToMultiAzReq) (*ConvertClusterToMultiAzResp, error)
+
+	// Cluster maintenance windows.
+	CreateMaintenanceWindow(ctx context.Context, clusterId string, req *UpsertMaintenanceWindowReq) (*CreateMaintenanceWindowResp, error)
+	ListMaintenanceWindows(ctx context.Context, clusterId string) (*ListMaintenanceWindowsResp, error)
+	GetMaintenanceWindow(ctx context.Context, clusterId, windowId string) (*GetMaintenanceWindowResp, error)
+	UpdateMaintenanceWindow(ctx context.Context, clusterId, windowId string, req *UpsertMaintenanceWindowReq) error
+	DeleteMaintenanceWindow(ctx context.Context, clusterId, windowId string) error
 }
 
 func NewClustersAPI(cli *client.CelerdataClient) IClusterAPI {
@@ -849,4 +856,45 @@ func (c *clusterAPI) ConvertClusterToMultiAz(ctx context.Context, req *ConvertCl
 		return nil, err
 	}
 	return resp, nil
+}
+
+// Cluster maintenance windows.
+
+func (c *clusterAPI) maintenanceWindowPath(clusterId, windowId string) string {
+	if windowId == "" {
+		return fmt.Sprintf("/api/%s/clusters/%s/maintenance-windows", c.apiVersion, clusterId)
+	}
+	return fmt.Sprintf("/api/%s/clusters/%s/maintenance-windows/%s", c.apiVersion, clusterId, windowId)
+}
+
+func (c *clusterAPI) CreateMaintenanceWindow(ctx context.Context, clusterId string, req *UpsertMaintenanceWindowReq) (*CreateMaintenanceWindowResp, error) {
+	resp := &CreateMaintenanceWindowResp{}
+	if err := c.cli.Post(ctx, c.maintenanceWindowPath(clusterId, ""), req, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (c *clusterAPI) ListMaintenanceWindows(ctx context.Context, clusterId string) (*ListMaintenanceWindowsResp, error) {
+	resp := &ListMaintenanceWindowsResp{}
+	if err := c.cli.Get(ctx, c.maintenanceWindowPath(clusterId, ""), nil, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (c *clusterAPI) GetMaintenanceWindow(ctx context.Context, clusterId, windowId string) (*GetMaintenanceWindowResp, error) {
+	resp := &GetMaintenanceWindowResp{}
+	if err := c.cli.Get(ctx, c.maintenanceWindowPath(clusterId, windowId), nil, resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (c *clusterAPI) UpdateMaintenanceWindow(ctx context.Context, clusterId, windowId string, req *UpsertMaintenanceWindowReq) error {
+	return c.cli.Put(ctx, c.maintenanceWindowPath(clusterId, windowId), req, nil)
+}
+
+func (c *clusterAPI) DeleteMaintenanceWindow(ctx context.Context, clusterId, windowId string) error {
+	return c.cli.Delete(ctx, c.maintenanceWindowPath(clusterId, windowId), nil, nil)
 }
